@@ -5,6 +5,17 @@ import scipy.io
 import torch
 import math
 
+if not torch.backends.mps.is_available():
+    if not torch.backends.mps.is_built():
+        print("MPS not available because the current PyTorch install was not "
+              "built with MPS enabled.")
+    else:
+        print("MPS not available because the current MacOS version is not 12.3+ "
+              "and/or you do not have an MPS-enabled device on this machine.")
+
+device = torch.device("mps")
+
+
 data = scipy.io.loadmat('/Users/ramtarun/Desktop/Cambridge/Indirect-Noise-in-Nozzles/Data/Data_PINN_ff0.01He0N551_subsonic.mat')
  
 eta = data['eta']
@@ -19,6 +30,7 @@ U[:,0] = eta
 U[:,1] = pi_p
 U[:,2] = pi_m
 U[:,3] = sig
+#print(U)
 
 D = data['D']
 M = data['M']
@@ -28,11 +40,9 @@ dudx = data['dudx']
 alpha = data['alp']
 eta1 = data['eta']    
 
-print(N1)
+#print(N1)
 
-meanflow = np.zeros((N1,7),dtype=np.float)
-
-
+meanflow = np.zeros((N1,7),dtype=float)
 meanflow[:,0] = D
 meanflow[:,1] = M
 meanflow[:,2] = u
@@ -41,10 +51,21 @@ meanflow[:,4] = dudx
 meanflow[:,5] = alpha
 meanflow[:,6] = eta1
 
-print(meanflow)
+#print(meanflow)
 
 
-def RHS_ff(x,y, baseflow):
+he = torch.tensor([0.01])
+HE = np.tile(he, (1,N1)) # N x T
+He = HE.flatten()[:,None]
+ETA = eta.flatten()[:, None]
+He_train = torch.from_numpy(He).type(torch.float32)
+ETA_train = torch.from_numpy(ETA).type(torch.float32)
+
+
+UU = torch.from_numpy(U[:, 1:4]).type(torch.float32)
+#print(UU)
+
+def RHS(x,y, baseflow):
     eta = x
     pi_p, pi_m, sig = torch.unstack (y ,axis=1)
     D = baseflow[:, 0]
@@ -53,7 +74,7 @@ def RHS_ff(x,y, baseflow):
     dMdx = baseflow[:, 3]
     dudx = baseflow[:, 4]
     alpha = baseflow[:, 5 ]
-    etal = baseflow[:, 6]
+    eta1 = baseflow[:, 6]
     He = 0# constant input
     gamma = 1.4#constant
     Msq = torch.math.square (M)
@@ -84,4 +105,90 @@ def RHS_ff(x,y, baseflow):
     eq3 = - (Ups*kp_m) *pi_p - (Ups*kp_p)*pi_m - (Ups)*sig
 
     return torch.stack([-eq1, -eq2, -eq3], axis=1)
+
+
+
+# Hyperparameters Initialization for tuning
+steps=2000
+learning_rate=1e-3
+layers = np.array([2, 20, 20, 20, 20, 20, 20, 20, 20, 3]) # hidden layers
+N_train = 5000
+
+# Neural Network for Predicting the pi+, pi-, and si.
+
+class NN(nn.Module):
+    def __init__(self, He, Eta, layers):
+        super().__init__()
+
+        'activation function'
+        self.activation = nn.Tanh()
+    
+        'Initialize neural network as a list using nn.Modulelist'  
+        self.linears = nn.ModuleList([nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)])
+    
+        'Xavier Normal Initialization'
+        for i in range(len(layers)-1):
+            
+            nn.init.xavier_normal_(self.linears[i].weight.data, gain=1.0)
+            
+            # set biases to zero
+            nn.init.zeros_(self.linears[i].bias.data)
+
+        
+        X = torch.cat([He, Eta],1)
+    def forward(self, X):
+        if torch.is_tensor(X) != True:         
+            X = torch.from_numpy(X)   
+        a = X.float()
+        for i in range(len(layers) - 2):
+            z = self.linears[i](a)
+            a = self.activation(z)
+        a = self.linears[-1](a)
+        return a
+        
+
+# Physics informed Neural Network 
+f = 0.01
+
+class PINN(nn.Module):
+    def __init__(self,He, Eta, uu, layers):
+        super().__init__()
+        self.loss_function = nn.MSELoss(reduction ='mean')
+
+        'Initialize our new parameters i.e.f (Inverse problem)' 
+        self.f = torch.tensor([f], requires_grad=True).type(torch.float32)
+        'Register f to optimize'
+        self.f = nn.Parameter(self.f)
+        'Initialize iterator'
+        self.iter = 0
+        'Call our DNN'
+        self.dnn = NN(He, Eta, layers)
+        'Register our new parameter'
+        self.dnn.register_parameter('f', self.f)  
+        
+        self.UU = uu
+        X = torch.cat([He, Eta],1)
+          
+    def loss_data(self, X):
+        g = torch.clone(X)
+        R = self.dnn(g)
+        loss_u = self.loss_function(R, self.UU)
+        return loss_u
+    
+    def loss_residual(self, X):
+        g = torch.clone(X)
+        R = self.dnn(g)
+        pass
+    
+
+
+check = PINN(He_train, ETA_train, UU, layers)
+N = torch.cat([He_train, ETA_train],1)
+
+
+
+
+        
+         
+
 
