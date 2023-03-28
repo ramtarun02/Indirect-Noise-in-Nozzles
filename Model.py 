@@ -53,6 +53,8 @@ meanflow[:,6] = eta1
 
 #print(meanflow)
 
+meanflow = torch.from_numpy(meanflow)
+
 
 he = torch.tensor([0.01])
 HE = np.tile(he, (1,N1)) # N x T
@@ -63,11 +65,14 @@ ETA_train = torch.from_numpy(ETA).type(torch.float32)
 
 
 UU = torch.from_numpy(U[:, 1:4]).type(torch.float32)
+
+
+ETA_train.requires_grad = True
 #print(UU)
 
 def RHS(x,y, baseflow):
     eta = x
-    pi_p, pi_m, sig = torch.unstack (y ,axis=1)
+    pi_p, pi_m, sig = torch.unbind(y ,axis=1)
     D = baseflow[:, 0]
     M = baseflow[:, 1]
     u = baseflow[:,2 ]
@@ -75,12 +80,13 @@ def RHS(x,y, baseflow):
     dudx = baseflow[:, 4]
     alpha = baseflow[:, 5 ]
     eta1 = baseflow[:, 6]
+    
     He = 0# constant input
     gamma = 1.4#constant
-    Msq = torch.math.square (M)
+    Msq = torch.square(M)
     f = 0.01 #Variable (parameter of the network)
     Lambda = 1 + Msq * (gamma-1)/2
-    zeta = f*gamma*Msq - 2*math.tan(alpha)
+    zeta = f*gamma*Msq - 2* torch.tan(alpha)
 
     C1= ( (gamma - 1)* (1-Msq)*f) / (2*Lambda*zeta)
     Ca = -C1*M*u*dMdx* (2- (2*Msq/(1-Msq)) - (2*gamma*Msq* (-2*f*Lambda - (gamma-1)/gamma *zeta) / (2*Lambda*zeta) ))
@@ -109,7 +115,7 @@ def RHS(x,y, baseflow):
 
 
 # Hyperparameters Initialization for tuning
-steps=2000
+epochs=2000
 learning_rate=1e-3
 layers = np.array([2, 20, 20, 20, 20, 20, 20, 20, 20, 3]) # hidden layers
 N_train = 5000
@@ -146,12 +152,10 @@ class NN(nn.Module):
         a = self.linears[-1](a)
         return a
         
-
-# Physics informed Neural Network 
 f = 0.01
 
 class PINN(nn.Module):
-    def __init__(self,He, Eta, uu, layers):
+    def __init__(self,He, Eta, uu, meanflow, layers):
         super().__init__()
         self.loss_function = nn.MSELoss(reduction ='mean')
 
@@ -166,6 +170,7 @@ class PINN(nn.Module):
         'Register our new parameter'
         self.dnn.register_parameter('f', self.f)  
         
+        self.meanflow = meanflow
         self.UU = uu
         X = torch.cat([He, Eta],1)
           
@@ -175,15 +180,39 @@ class PINN(nn.Module):
         loss_u = self.loss_function(R, self.UU)
         return loss_u
     
-    def loss_residual(self, X):
+    def loss_residual(self, Eta, X):
         g = torch.clone(X)
         R = self.dnn(g)
-        pass
+        GR = RHS(Eta, R, self.meanflow)
+        dr_dn = torch.autograd.grad(R,Eta,torch.ones_like(R), retain_graph=True, create_graph=True)[0]
+        pde = dr_dn - GR
+        null = torch.zeros(Eta.shape[0],1)#to minimize function
+        loss_r = self.loss_function(pde.float(), null.float())
+        return loss_r
     
+    def Loss(self, X, Eta):
+        loss_data = self.loss_data(X)
+        loss_residual = self.loss_residual(Eta, X)
+        return loss_data + loss_residual
 
 
-check = PINN(He_train, ETA_train, UU, layers)
 N = torch.cat([He_train, ETA_train],1)
+
+PINN_model = PINN(He_train, ETA_train, UU, meanflow, layers)
+params = list(PINN_model.parameters())
+optimizer = torch.optim.Adam(PINN_model.parameters(),lr=learning_rate,amsgrad=False)
+
+for i in range(epochs):
+    if i==0:
+      print("Training Loss")
+    loss = PINN_model.Loss(N, ETA_train)# use mean squared error
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if i%(epochs/10)==0:
+       with torch.no_grad():
+          print(loss.detach().numpy())
 
 
 
